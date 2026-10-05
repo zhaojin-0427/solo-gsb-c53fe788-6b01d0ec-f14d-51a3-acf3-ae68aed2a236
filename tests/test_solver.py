@@ -1,7 +1,11 @@
 """求解器单元测试：评分、约束、平分确定性、覆盖可行性。"""
+import itertools
+import random
+
 from app.solver import (
     InputAnnotation,
     SolveParams,
+    _strict_contains,
     dice_overlap,
     quantize_overlap,
     solve_consensus,
@@ -169,3 +173,93 @@ def test_zero_overlap_and_foreign_label_not_counted():
     assert a.score == 80
     assert by[(4, 8, 1)].score == 50
     assert by[(0, 4, 2)].score == 100
+
+
+# ---------------------------------------------------------------------------
+# 大候选数回归：目标系数 int64 安全 + 任意候选数的严格字典序平分
+# ---------------------------------------------------------------------------
+def test_sixty_min_weight_candidates_no_overflow():
+    # 回归：60 个合法候选、每个候选至少一条权重 1 的自身标注（得分 10）时，
+    # 旧单项目标系数 10×2^60 ≈ 1.2e19 超出 int64，CP-SAT 判 MODEL_INVALID。
+    annotations = [
+        ann(i % 2 + 1, 2 * i, 2 * i + 2, 1, weight=1) for i in range(60)
+    ]
+    res = solve_consensus(annotations, set(), set())
+    assert res.status == "OPTIMAL"
+    assert all(res.chosen)                     # 60 个候选互不冲突，全部入选
+    assert res.total_score == 60 * 10
+
+
+def test_lexicographic_tie_break_beyond_60_candidates():
+    # 回归：n>60 时旧线性平分权重（前项权重 < 后项权重和）不能保证字典序。
+    # [0,100) 得分 690，与 69 个互不冲突的小区间（各 10 分）总分相同；
+    # 字典序最大解必须只选排序最前的 [0,100)。
+    annotations = [ann(k + 1, 0, 100, 1, weight=10) for k in range(6)]
+    annotations.append(ann(7, 0, 100, 1, weight=9))
+    annotations += [ann(8, i, i + 1, 1, weight=1) for i in range(1, 70)]
+    res = solve_consensus(annotations, set(), set())
+    big = next(c for c in res.candidates if (c.start, c.end) == (0, 100))
+    assert res.status == "OPTIMAL"
+    assert res.total_score == 690
+    assert res.chosen[big.index] is True
+    assert sum(res.chosen) == 1
+    # 确定性：同输入再解一次，结果完全一致
+    res2 = solve_consensus(annotations, set(), set())
+    assert res2.chosen == res.chosen
+
+
+def test_lexicographic_tie_break_across_chunks():
+    # 130 个同区间异标签候选（平分向量跨 3 个 60 位块）：两两冲突、
+    # 得分全等，字典序最大解 = 只选排序后的第 0 个候选。
+    annotations = [
+        InputAnnotation(1, "a1", 1, 0, 100, lid, f"L{lid:03d}")
+        for lid in range(1, 131)
+    ]
+    res = solve_consensus(annotations, set(), set())
+    assert res.status == "OPTIMAL"
+    assert res.total_score == 10
+    assert sum(res.chosen) == 1
+    assert res.chosen[0] is True
+
+
+def test_staged_solve_matches_bruteforce_small():
+    # 小规模等价性：分阶段求解结果必须等于暴力枚举的
+    # 「总分最大；平分取 (start,end,label) 排序布尔向量字典序最大」，
+    # 保证重构不改变既有小规模解。
+    rng = random.Random(20261005)
+    for _ in range(10):
+        n = rng.randint(1, 12)
+        annotations = [
+            ann(rng.randint(1, 3), s := rng.randint(0, 12),
+                s + rng.randint(1, 5), rng.randint(1, 3),
+                weight=rng.randint(1, 10))
+            for _ in range(n)
+        ]
+        nesting = {(3, 1)} if rng.random() < 0.5 else set()
+        mutex = {(1, 2)} if rng.random() < 0.5 else set()
+        res = solve_consensus(annotations, nesting, mutex)
+        assert res.status == "OPTIMAL"
+        cands, m = res.candidates, len(res.candidates)
+        mutex_sets = {frozenset(p) for p in mutex}
+
+        def compatible(a, b):
+            if not (a.start < b.end and b.start < a.end):
+                return True
+            if frozenset((a.label_id, b.label_id)) in mutex_sets:
+                return False
+            if _strict_contains(a, b) and (a.label_id, b.label_id) in nesting:
+                return True
+            if _strict_contains(b, a) and (b.label_id, a.label_id) in nesting:
+                return True
+            return False
+
+        best_total, best_bits = 0, (False,) * m   # 空集永远可行
+        for bits in itertools.product([False, True], repeat=m):
+            if any(bits[i] and bits[j] and not compatible(cands[j], cands[i])
+                   for i in range(m) for j in range(i)):
+                continue
+            total = sum(cands[i].score for i in range(m) if bits[i])
+            if total > best_total or (total == best_total and bits > best_bits):
+                best_total, best_bits = total, bits
+        assert tuple(res.chosen) == best_bits
+        assert res.total_score == best_total

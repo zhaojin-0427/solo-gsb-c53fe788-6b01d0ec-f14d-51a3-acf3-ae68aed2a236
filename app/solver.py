@@ -21,9 +21,14 @@
     * 两个区间重叠时，只有「严格包含且标签允许嵌套」才能共存；
       相交但互不包含（交叉）或互斥标签一律禁止共存。
 
-平分（总得分相同）时，通过次级目标在所有最优解中确定性地选择
+平分（总得分相同）时，通过分阶段求解在所有最优解中确定性地选择
 按 (start 升序, end 升序, label 升序) 排序后的候选布尔向量
-字典序最大的解：排序靠前的候选优先被采纳。
+字典序最大的解：排序靠前的候选优先被采纳。分两阶段，保证任意
+候选数下目标系数都在有符号 64 位范围内：
+    阶段 1：最大化总分（系数 = 候选得分，有界小整数）；
+    阶段 2：固定总分最优值，把候选布尔向量切成不超过
+            TIE_CHUNK_BITS 位的块，块内用 2 的幂权重逐块最大化
+            并固定最优值——块间求解顺序即字典序先后。
 """
 from __future__ import annotations
 
@@ -34,13 +39,16 @@ from typing import Any
 from ortools.sat.python import cp_model
 
 ALGORITHM_NAME = "adj-cpsat-consensus"
-ALGORITHM_VERSION = "1.1.0"
+ALGORITHM_VERSION = "1.2.0"
 
 # 得分放大倍数：权重 1..10 的整数与 Dice 系数（一位小数量化）
 # 相乘后仍为整数，CP-SAT 只处理整数目标。
 SCORE_SCALE = 10
 # 默认标签不一致时的系数（本应用候选带标签，实际只聚合同标签支持）。
 DEFAULT_LABEL_MATCH_WEIGHT = 1.0
+# 平分裁决第二阶段的分块位数：块内 2 的幂权重最大系数为
+# 2^(TIE_CHUNK_BITS-1)，块目标和 < 2^TIE_CHUNK_BITS，远小于 int64 上限。
+TIE_CHUNK_BITS = 60
 
 
 def dice_overlap(a_start: int, a_end: int, b_start: int, b_end: int) -> float:
@@ -219,35 +227,59 @@ def solve_consensus(
         for i in forced_out:
             model.add(x[i] == 0)
 
-    # ---- 4. 目标 + 确定性平分裁决 ---------------------------------------
+    # ---- 4. 目标 + 确定性平分裁决（分阶段求解，系数安全） ---------------
+    # 旧实现把「big × 总分 + Σ 平分权重·x_k」塞进单项目标：n=60 且每个
+    # 候选至少有一条权重 1 的自身标注（得分 ≥ 10）时，2 的幂方案系数
+    # 已达 10×2^60 ≈ 1.2e19，超出 int64（≈9.2e18），CP-SAT 判
+    # MODEL_INVALID；n>60 退化的线性权重（Σ 后项可超过前项）又不能
+    # 保证严格字典序。这里改为分阶段求解，各阶段系数始终安全：
+    #   阶段 1：最大化总分 total。系数 = 候选得分（≤ 标注者数 × 权重
+    #           10 × 量化重叠 10，本应用 ≤ 800），任意候选数都不溢出；
+    #   阶段 2：固定 total 为阶段 1 最优值，把按 (start,end,label_name,
+    #           label_id) 排序的候选布尔向量切成 ≤ TIE_CHUNK_BITS 位的
+    #           块，块内用 2 的幂权重（最大系数 2^59）逐块最大化并把该
+    #           块固定到最优值——块间求解顺序即字典序先后，整体等价于
+    #           在全部总分最优解中选布尔向量字典序最大者，对任意候选数
+    #           成立；n ≤ 60 时与旧单目标结果完全一致。
     total = sum(c.score * x[c.index] for c in candidates)
 
-    # 次级权重：候选已按 (start,end,label) 排序，靠前的给更大权重，
-    # 在「总得分相同」的解集合中选字典序最优 => 确定性、与需求一致。
-    # 最大候选数受区间校验约束，通常很小；N<=60 时用 2 的幂保证严格字典序，
-    # 更大时退化为线性权重（仍单调，记录在参数说明中）。
-    if n == 0:
-        tie_weight: list[int] = []
-    elif n <= 60:
-        tie_weight = [1 << (n - 1 - k) for k in range(n)]
-    else:
-        tie_weight = [n - k for k in range(n)]
+    def _new_solver() -> cp_model.CpSolver:
+        s = cp_model.CpSolver()
+        s.parameters.num_search_workers = 1   # 单线程 => 结果确定
+        s.parameters.max_time_in_seconds = 30.0
+        s.parameters.random_seed = 42
+        return s
 
-    if n <= 60:
-        # 严格字典序：即使平分，次级目标永远小于 1 个主目标单位。
-        big = 1 << n  # > 最大次级和 (2^n - 1)
-        model.maximize(big * total + sum(tie_weight[k] * x[k] for k in range(n)))
-    elif n:
-        big = n * (n + 1) // 2 + 1
-        model.maximize(big * total + sum(tie_weight[k] * x[k] for k in range(n)))
-
-    solver = cp_model.CpSolver()
-    solver.parameters.num_search_workers = 1   # 单线程 => 结果确定
-    solver.parameters.max_time_in_seconds = 30.0
-    solver.parameters.random_seed = 42
+    model.maximize(total)
+    solver = _new_solver()
     status = solver.solve(model)
-
+    wall = solver.wall_time
     feasible = status in (cp_model.OPTIMAL, cp_model.FEASIBLE)
+
+    if feasible and n > 0:
+        # 注意：solver.objective_value 是浮点近似（如 229.99999999999997），
+        # 不能直接回写为等式约束；目标值一律从解的变量取值精确重算。
+        best_total = sum(
+            candidates[i].score for i in range(n) if solver.value(x[i])
+        )
+        # 阶段 2：在总分最优解集内做字典序平分裁决（分块 2 的幂）
+        model.add(total == best_total)
+        for lo in range(0, n, TIE_CHUNK_BITS):
+            hi = min(lo + TIE_CHUNK_BITS, n)
+            m = hi - lo
+            lex = sum((1 << (m - 1 - j)) * x[lo + j] for j in range(m))
+            model.maximize(lex)
+            s2 = _new_solver()
+            st2 = s2.solve(model)
+            wall += s2.wall_time
+            if st2 not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+                break  # 可行域非空，理论不发生；保底沿用上一阶段的解
+            best_lex = sum(
+                (1 << (m - 1 - j)) * s2.value(x[lo + j]) for j in range(m)
+            )
+            model.add(lex == best_lex)
+            solver = s2
+
     chosen = [bool(solver.value(x[i])) for i in range(n)] if feasible else [False] * n
     total_score = sum(candidates[i].score for i in range(n) if chosen[i])
     raw_total = round(total_score / SCORE_SCALE, 4)
@@ -258,8 +290,8 @@ def solve_consensus(
         total_score=total_score,
         raw_total_score=raw_total,
         status=solver.status_name(status),
-        wall_seconds=solver.wall_time,
-        objective_value=int(solver.objective_value) if feasible else 0,
+        wall_seconds=wall,
+        objective_value=total_score,
         forced=forced,
         forced_out=forced_out,
     )

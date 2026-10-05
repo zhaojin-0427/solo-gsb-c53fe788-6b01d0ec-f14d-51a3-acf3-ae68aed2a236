@@ -224,7 +224,9 @@ def persist_consensus(conn, project_id: int, snapshot, params: SolveParams,
                 "overlap_quantization": "round(dice*score_scale)/score_scale",
                 "support_rule": "same label & overlap>0; one annotation may support multiple candidates",
                 "contribution": "weight * label_match_weight * quantize(dice) / score_scale",
-                "tie_break": "lexicographic by (start,end,label_name,label_id)",
+                "tie_break": "lexicographic by (start,end,label_name,label_id); "
+                             "staged solve: maximize total score first, then "
+                             "chunked power-of-2 lexicographic (int64-safe)",
             }),
             db.dumps(snapshot),
             db.utcnow(),

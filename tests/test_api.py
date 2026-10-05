@@ -212,3 +212,80 @@ def test_partial_overlap_scoring_end_to_end():
     assert {s["annotator_name"] for s in adopted[0]["supporters"]} == {"甲", "乙", "丙"}
     assert abs(sum(s["contribution"] for s in adopted[0]["supporters"])
                - adopted[0]["raw_score"]) < 1e-9
+
+
+def test_sixty_min_weight_candidates_end_to_end():
+    """大候选数回归：60 个合法候选、每个仅一条权重 1 的自身标注。
+    旧单项目标系数 10×2^60 超出 int64，求解报 MODEL_INVALID；
+    修复后接口应返回 OPTIMAL 且全部入选。"""
+    pid = client.post("/api/projects", json={"name": "sixty-candidates"}).json()["id"]
+    client.post(f"/api/projects/{pid}/documents", json={
+        "doc_id": "d60", "content": "x" * 120,
+        "token_bounds": [[i, i + 1] for i in range(120)]})
+    lab = client.post(f"/api/projects/{pid}/labels",
+                      json={"name": "ENTITY", "color": "#2563eb"}).json()["id"]
+    u1 = client.post(f"/api/projects/{pid}/annotators",
+                     json={"name": "甲", "weight": 1}).json()["id"]
+    u2 = client.post(f"/api/projects/{pid}/annotators",
+                     json={"name": "乙", "weight": 1}).json()["id"]
+    batch = [{"annotator_id": u1 if i % 2 == 0 else u2, "label_id": lab,
+              "start": 2 * i, "end": 2 * i + 2} for i in range(60)]
+    r = client.post(f"/api/projects/{pid}/documents/d60/annotations/batch",
+                    json={"annotations": batch})
+    assert r.status_code == 201, r.text
+
+    con = client.post(f"/api/projects/{pid}/documents/d60/consensus", json={}).json()
+    assert con["solver_status"] == "OPTIMAL"
+    assert len(con["items"]) == 60
+    assert all(i["adopted"] for i in con["items"])
+    assert con["total_score"] == 600
+
+
+def test_large_candidate_consensus_override_and_report():
+    """大候选数回归（n=70）：求解、带理由覆盖、报告全链路正常；
+    总分平分时按 (起点,终点,标签) 字典序确定胜者，不靠限制候选数。"""
+    pid = client.post("/api/projects", json={"name": "large-candidates"}).json()["id"]
+    client.post(f"/api/projects/{pid}/documents", json={
+        "doc_id": "big", "content": "x" * 100,
+        "token_bounds": [[i, i + 1] for i in range(100)]})
+    lab = client.post(f"/api/projects/{pid}/labels",
+                      json={"name": "ENTITY", "color": "#2563eb"}).json()["id"]
+    uids = [
+        client.post(f"/api/projects/{pid}/annotators",
+                    json={"name": f"u{k}", "weight": w}).json()["id"]
+        for k, w in enumerate([10, 10, 10, 10, 10, 10, 9, 1])
+    ]
+    # 7 名高权重标注者一致标 [0,100)（得分 690）；
+    # 第 8 名（权重 1）标 69 个互不冲突的小区间（各 10 分，共 690）=> 总分平分
+    batch = [{"annotator_id": uids[k], "label_id": lab, "start": 0, "end": 100}
+             for k in range(7)]
+    batch += [{"annotator_id": uids[7], "label_id": lab,
+               "start": i, "end": i + 1} for i in range(1, 70)]
+    r = client.post(f"/api/projects/{pid}/documents/big/annotations/batch",
+                    json={"annotations": batch})
+    assert r.status_code == 201, r.text
+
+    con = client.post(f"/api/projects/{pid}/documents/big/consensus", json={}).json()
+    assert con["solver_status"] == "OPTIMAL"
+    assert len(con["items"]) == 70          # 候选不截断、不限制数量
+    adopted = [(i["start"], i["end"]) for i in con["items"] if i["adopted"]]
+    assert adopted == [(0, 100)]            # 平分字典序：排序最前者胜
+    assert con["total_score"] == 690
+
+    # 带理由覆盖：强制否决 [0,100) => 同一快照重解，69 个小区间入选
+    con2 = client.post(
+        f"/api/projects/{pid}/consensuses/{con['id']}/override", json={
+            "action": "deselect", "start": 0, "end": 100, "label_id": lab,
+            "reason": "裁决：改采全部小区间"}).json()
+    adopted2 = {(i["start"], i["end"]) for i in con2["items"] if i["adopted"]}
+    assert len(adopted2) == 69 and (0, 100) not in adopted2
+    assert con2["total_score"] == 690
+    assert con2["id"] != con["id"]
+
+    # 大候选共识可生成不可变报告，快照与明细完整
+    rep = client.post(
+        f"/api/projects/{pid}/consensuses/{con2['id']}/report", json={}).json()
+    assert rep["solver"]["total_score"] == 690
+    assert len(rep["input_snapshot"]["annotations"]) == 76
+    assert len(rep["consensus"]["all_items"]) == 70
+    assert len(rep["consensus"]["adopted"]) == 69
