@@ -1,0 +1,35 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>共识报告 · 多标注语料冲突裁决台</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header class="topbar">
+  <h1>📄 不可变共识报告</h1>
+  <a class="btn small ghost" href="/static/index.html">← 返回裁决台</a>
+</header>
+
+<main style="max-width:980px">
+  <section class="card">
+    <div class="row wrap">
+      <label>项目
+        <select id="reportProject"></select>
+      </label>
+      <label>报告版本
+        <select id="reportVersion"></select>
+      </label>
+      <button class="btn" id="loadReportBtn">打开报告</button>
+      <span class="hint" id="hashState"></span>
+    </div>
+  </section>
+
+  <div id="reportView" class="hidden"></div>
+</main>
+
+<div id="toast" class="toast hidden"></div>
+<script src="/static/report.js"></script>
+</body>
+</html>

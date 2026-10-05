@@ -1,0 +1,19 @@
+services:
+  adjudication:
+    build: .
+    image: multi-annotator-adjudication:latest
+    container_name: adjudication-console
+    ports:
+      - "8000:8000"
+    volumes:
+      - adj-data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health').status==200 else 1)"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  adj-data:

@@ -1,0 +1,155 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>多标注语料冲突裁决台</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header class="topbar">
+  <h1>⚖️ 多标注语料冲突裁决台</h1>
+  <div class="project-bar">
+    <label>项目
+      <select id="projectSelect"></select>
+    </label>
+    <button id="newProjectBtn" class="btn small">新建项目</button>
+    <button id="loadDemoBtn" class="btn small ghost" title="载入内置示例">载入示例</button>
+    <a class="btn small ghost" href="/static/report.html">报告查看器 ↗</a>
+  </div>
+</header>
+
+<main>
+<!-- ================= 步骤 1：文档 ================= -->
+<section class="card" id="docCard">
+  <h2><span class="step">1</span> 导入 UTF-8 文档与词元边界</h2>
+  <div class="row">
+    <input id="docId" placeholder="文档 ID，例如 doc-001" class="grow">
+    <select id="docSelect" title="已导入文档（选择查看历史版本）"></select>
+  </div>
+  <textarea id="docContent" rows="5" placeholder="粘贴 UTF-8 纯文本文档（支持换行、制表符）…"></textarea>
+  <div class="row">
+    <label class="check"><input type="checkbox" id="autoTokens" checked>
+      未提供词元边界时按单个字符切分（也可在下方填写 JSON：[[start,end],…]）</label>
+  </div>
+  <textarea id="tokenBounds" rows="2" placeholder='可选：词元边界 JSON，如 [[0,3],[3,5]]（端点为字符偏移，左闭右开）'></textarea>
+  <div class="row">
+    <button class="btn primary" id="importDocBtn">导入 / 追加新版本</button>
+    <span class="hint" id="docMeta"></span>
+  </div>
+  <pre class="doc-preview" id="docPreview"></pre>
+</section>
+
+<!-- ================= 步骤 2：标签规则 ================= -->
+<section class="card" id="labelCard">
+  <h2><span class="step">2</span> 定义标签（可嵌套 / 互斥）</h2>
+  <div class="row wrap">
+    <input id="labelName" placeholder="新标签名，如 PERSON">
+    <input id="labelColor" type="color" value="#6366f1" title="标签颜色">
+    <button class="btn" id="addLabelBtn">添加标签</button>
+  </div>
+  <div id="labelList" class="chip-row"></div>
+
+  <h3>结构规则</h3>
+  <div class="rule-box">
+    <div class="row wrap">
+      <select id="ruleKind">
+        <option value="nesting">嵌套（外层 ⊃ 内层）</option>
+        <option value="mutex">互斥（区间重叠时二选一）</option>
+      </select>
+      <select id="ruleA"></select>
+      <span id="ruleArrow">⊃</span>
+      <select id="ruleB"></select>
+      <button class="btn" id="addRuleBtn">添加规则</button>
+    </div>
+    <ul id="ruleList" class="rule-list"></ul>
+  </div>
+</section>
+
+<!-- ================= 步骤 3：标注者 ================= -->
+<section class="card" id="annotatorCard">
+  <h2><span class="step">3</span> 标注者与权重（1～10，求共识需 2～8 名）</h2>
+  <div class="row wrap">
+    <input id="annotatorName" placeholder="标注者姓名">
+    <input id="annotatorWeight" type="number" min="1" max="10" value="5" style="width:90px">
+    <button class="btn" id="addAnnotatorBtn">添加</button>
+  </div>
+  <table class="grid" id="annotatorTable">
+    <thead><tr><th>ID</th><th>姓名</th><th>权重</th><th></th></tr></thead>
+    <tbody></tbody>
+  </table>
+</section>
+
+<!-- ================= 步骤 4：提交标注 ================= -->
+<section class="card" id="annotationCard">
+  <h2><span class="step">4</span> 提交字符区间标注（2～8 名标注者对同一文档）</h2>
+  <p class="hint">在下方文档中拖选文字后点击「用选区填充」，区间端点必须对齐词元边界，否则被拒绝。</p>
+  <div class="row wrap">
+    <select id="annAnnotator"></select>
+    <select id="annLabel"></select>
+    <input id="annStart" type="number" min="0" placeholder="start" style="width:90px">
+    <input id="annEnd" type="number" min="0" placeholder="end" style="width:90px">
+    <button class="btn small" id="useSelectionBtn">用选区填充</button>
+    <button class="btn primary" id="addAnnBtn">提交标注</button>
+    <span id="selInfo" class="hint"></span>
+  </div>
+  <div class="highlight-host" id="textHost"><pre id="selectableText"></pre></div>
+  <table class="grid" id="annotationTable">
+    <thead><tr><th>ID</th><th>标注者(权重)</th><th>标签</th><th>区间</th><th>文本</th><th></th></tr></thead>
+    <tbody></tbody>
+  </table>
+</section>
+
+<!-- ================= 步骤 5：共识裁决 ================= -->
+<section class="card" id="consensusCard">
+  <h2><span class="step">5</span> 确定性共识裁决（OR-Tools CP-SAT）</h2>
+  <div class="row">
+    <button class="btn primary big" id="solveBtn">▶ 求最大得分共识</button>
+    <select id="consensusHistory" title="历史共识"></select>
+    <span id="solveMeta" class="hint"></span>
+  </div>
+  <details id="solveParams" class="hidden">
+    <summary>实际算法参数与版本</summary>
+    <pre class="json" id="solveParamsJson"></pre>
+  </details>
+
+  <h3>✅ 采纳的共识区间</h3>
+  <div class="highlight-host" id="adoptedHost"><pre id="adoptedText"></pre></div>
+  <table class="grid" id="adoptedTable">
+    <thead><tr><th>区间</th><th>标签</th><th>得分</th><th>支持者</th><th>来源</th></tr></thead>
+    <tbody></tbody>
+  </table>
+
+  <h3>⚠️ 未采纳的候选标注 <span class="hint">（含每位支持者及其权重/重叠比例）</span></h3>
+  <table class="grid" id="rejectedTable">
+    <thead><tr><th>区间</th><th>标签</th><th>得分</th><th>支持者明细</th><th>裁决覆盖</th></tr></thead>
+    <tbody></tbody>
+  </table>
+
+  <div class="override-box">
+    <h3>🛠️ 裁决者覆盖（强制采纳 / 否决，需注明理由）</h3>
+    <div class="row wrap">
+      <select id="ovAction">
+        <option value="select">强制采纳</option>
+        <option value="deselect">强制否决</option>
+      </select>
+      <select id="ovLabel"></select>
+      <input id="ovStart" type="number" min="0" placeholder="start" style="width:90px">
+      <input id="ovEnd" type="number" min="0" placeholder="end" style="width:90px">
+    </div>
+    <textarea id="ovReason" rows="2" placeholder="裁决理由（必填，将写入共识快照与报告）"></textarea>
+    <button class="btn" id="overrideBtn">提交覆盖并基于同一快照重算</button>
+    <ul id="overrideList" class="rule-list"></ul>
+  </div>
+
+  <div class="row">
+    <button class="btn primary" id="reportBtn">📄 生成不可变共识报告</button>
+    <a id="openReportLink" class="btn ghost hidden" target="_blank">在报告查看器中打开 ↗</a>
+  </div>
+</section>
+</main>
+
+<div id="toast" class="toast hidden"></div>
+<script src="/static/app.js"></script>
+</body>
+</html>
