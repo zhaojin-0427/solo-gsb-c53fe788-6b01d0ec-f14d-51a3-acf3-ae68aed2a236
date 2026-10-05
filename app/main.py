@@ -29,6 +29,7 @@ from .solver import (
     ALGORITHM_NAME,
     ALGORITHM_VERSION,
     SCORE_SCALE,
+    TIE_BLOCK_SIZE,
     InputAnnotation,
     SolveParams,
     solve_consensus,
@@ -225,6 +226,11 @@ def persist_consensus(conn, project_id: int, snapshot, params: SolveParams,
                 "support_rule": "same label & overlap>0; one annotation may support multiple candidates",
                 "contribution": "weight * label_match_weight * quantize(dice) / score_scale",
                 "tie_break": "lexicographic by (start,end,label_name,label_id)",
+                "tie_break_method": (
+                    "staged: maximize total score first, then fix it and maximize "
+                    f"blocked power-of-two binary weights (block_size={TIE_BLOCK_SIZE}); "
+                    "safe 64-bit integer coefficients for any candidate count"
+                ),
             }),
             db.dumps(snapshot),
             db.utcnow(),
@@ -640,6 +646,12 @@ def solve(project_id: int, doc_id: str):
 
         params = SolveParams()
         result = run_from_snapshot(snapshot, params)
+        if result.status not in ("OPTIMAL", "FEASIBLE"):
+            raise HTTPException(
+                409,
+                "求解器未能找到可行共识（模型不可行或无效）；"
+                "请检查嵌套/互斥标签规则与标注区间后重试",
+            )
         cid = persist_consensus(conn, project_id, snapshot, params, result, [])
         return serialize_consensus(conn, cid)
 

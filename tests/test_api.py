@@ -212,3 +212,64 @@ def test_partial_overlap_scoring_end_to_end():
     assert {s["annotator_name"] for s in adopted[0]["supporters"]} == {"甲", "乙", "丙"}
     assert abs(sum(s["contribution"] for s in adopted[0]["supporters"])
                - adopted[0]["raw_score"]) < 1e-9
+
+
+def test_large_candidate_consensus_end_to_end():
+    """60+ 候选（每候选至少一条权重 1 的自身标注）端到端：
+    旧版在此规模下 CP-SAT 模型 INVALID；修复后应求出最优共识、
+    支持覆盖并生成不可变报告。"""
+    pid = client.post("/api/projects", json={"name": "large-candidates"}).json()["id"]
+    n = 65
+    client.post(f"/api/projects/{pid}/documents", json={
+        "doc_id": "big",
+        "content": "ab" * n,
+        "token_bounds": [[2 * k, 2 * k + 2] for k in range(n)],
+    })
+    lab = client.post(f"/api/projects/{pid}/labels",
+                      json={"name": "ENT", "color": "#2563eb"}).json()["id"]
+    u1 = client.post(f"/api/projects/{pid}/annotators",
+                     json={"name": "子", "weight": 1}).json()["id"]
+    u2 = client.post(f"/api/projects/{pid}/annotators",
+                     json={"name": "丑", "weight": 1}).json()["id"]
+    r = client.post(f"/api/projects/{pid}/documents/big/annotations/batch", json={
+        "annotations": [
+            {"annotator_id": u1, "label_id": lab, "start": 2 * k, "end": 2 * k + 2}
+            for k in range(n)
+        ] + [
+            {"annotator_id": u2, "label_id": lab, "start": 2 * k, "end": 2 * k + 2}
+            for k in range(n)
+        ],
+    })
+    assert r.status_code == 201, r.text
+
+    con = client.post(f"/api/projects/{pid}/documents/big/consensus", json={})
+    assert con.status_code == 201, con.text
+    body = con.json()
+    assert body["solver_status"] == "OPTIMAL"
+    assert len(body["items"]) == n
+    assert all(it["adopted"] for it in body["items"])
+    # 每候选两名权重 1 标注者：展示分 2.0，整数分 20
+    assert all(it["score"] == 20 and it["raw_score"] == 2.0 for it in body["items"])
+    assert body["raw_total_score"] == round(2.0 * n, 4)
+    assert "tie_break_method" in body["params"]
+
+    # 覆盖：否决第一个候选后重新求解，其余仍全入选
+    ov = client.post(
+        f"/api/projects/{pid}/consensuses/{body['id']}/override", json={
+            "action": "deselect", "start": 0, "end": 2, "label_id": lab,
+            "reason": "大候选数下的覆盖回归",
+        })
+    assert ov.status_code == 201, ov.text
+    ob = ov.json()
+    assert ob["solver_status"] == "OPTIMAL"
+    assert sum(1 for it in ob["items"] if it["adopted"]) == n - 1
+
+    # 报告可生成、读取，且分阶段算法参数随报告固化
+    rep = client.post(
+        f"/api/projects/{pid}/consensuses/{ob['id']}/report", json={})
+    assert rep.status_code == 201, rep.text
+    rb = rep.json()
+    got = client.get(f"/api/projects/{pid}/reports/{rb['report_version']}").json()
+    assert got["algorithm"]["version"] == body["algorithm_version"]
+    assert "tie_break_method" in got["parameters"]
+    assert len(got["consensus"]["adopted"]) == n - 1

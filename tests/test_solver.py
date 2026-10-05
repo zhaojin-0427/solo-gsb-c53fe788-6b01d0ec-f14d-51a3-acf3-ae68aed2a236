@@ -1,7 +1,9 @@
 """求解器单元测试：评分、约束、平分确定性、覆盖可行性。"""
+import app.solver as solver_mod
 from app.solver import (
     InputAnnotation,
     SolveParams,
+    TIE_BLOCK_SIZE,
     dice_overlap,
     quantize_overlap,
     solve_consensus,
@@ -169,3 +171,145 @@ def test_zero_overlap_and_foreign_label_not_counted():
     assert a.score == 80
     assert by[(4, 8, 1)].score == 50
     assert by[(0, 4, 2)].score == 100
+
+
+# ---------------------------------------------------------------------------
+# 大候选数回归：旧版 2 的幂次合成目标在 60 个候选、每候选至少一条权重 1
+# 的自身标注时单项目标系数超过 CP-SAT 的 2^62 系数上限（MODEL_INVALID）；
+# n>60 的线性次级权重又不保证严格字典序。分阶段求解必须同时解决两者。
+# ---------------------------------------------------------------------------
+def _disjoint_candidates(n, weight=1):
+    """n 个互不重叠的同标签候选，每候选两条权重为 weight 的自身标注。"""
+    out = []
+    for k in range(n):
+        out.append(ann(1, 2 * k, 2 * k + 2, 1, weight))
+        out.append(ann(2, 2 * k, 2 * k + 2, 1, weight))
+    return out
+
+
+def test_60_candidates_min_weight_no_longer_model_invalid():
+    # 题目原例：60 个合法候选，每条候选至少一条权重 1 的自身标注
+    res = solve_consensus(_disjoint_candidates(60, weight=1), set(), set())
+    assert res.status == "OPTIMAL"
+    assert sum(res.chosen) == 60
+    # 每候选 score = 2 名标注者 × 权重 1 × 量化 10 = 20
+    assert res.total_score == 60 * 20
+    assert res.raw_total_score == 120.0
+
+
+def test_candidate_counts_above_60_and_block_boundaries():
+    for n in (61, 79, 80, 81, 120, 250):
+        res = solve_consensus(_disjoint_candidates(n), set(), set())
+        assert res.status == "OPTIMAL", n
+        assert sum(res.chosen) == n, n
+        assert res.total_score == 20 * n
+
+
+def test_large_n_tie_break_prefers_earlier_candidate():
+    # 82 个候选（跨 3 个分块）：构造一对真正同分、同标签重叠的冲突候选
+    # [0,2) 与 [0,4)（两名权重 1 标注者同时标注二者；
+    # dice([0,2),[0,4))=2/3→q7，二者得分都为 20+14=34），
+    # 另放 80 个从 [6,8) 起、互不重叠且不与二者相交的独立候选（各 20 分）。
+    # 平分时必须取 (起点, 终点) 都更小的 [0,2)，其余独立候选全部入选。
+    annotations = [
+        ann(1, 0, 2, 1, 1), ann(2, 0, 2, 1, 1),
+        ann(1, 0, 4, 1, 1), ann(2, 0, 4, 1, 1),
+    ]
+    for k in range(80):
+        s = 6 + 2 * k
+        annotations += [ann(1, s, s + 2, 1, 1), ann(2, s, s + 2, 1, 1)]
+    res = solve_consensus(annotations, set(), set())
+    assert res.status == "OPTIMAL"
+    by = {(c.start, c.end, c.label_id): c for c in res.candidates}
+    assert by[(0, 2, 1)].score == by[(0, 4, 1)].score == 34
+    # 等分同标签重叠：[0,2) 字典序靠前，入选；[0,4) 落选
+    assert res.chosen[by[(0, 2, 1)].index] is True
+    assert res.chosen[by[(0, 4, 1)].index] is False
+    assert sum(res.chosen) == 81
+    assert res.total_score == 34 + 80 * 20
+
+
+def test_staged_tie_break_matches_bruteforce_across_blocks(monkeypatch):
+    # 把分块缩小到 3，枚举 7~12 个候选（跨 3~4 块）的所有可行解，
+    # 直接验证「逐块锁定」得到 (总分, 布尔向量字典序) 的全局最优。
+    monkeypatch.setattr(solver_mod, "TIE_BLOCK_SIZE", 3)
+    import random
+
+    rng = random.Random(11)
+    for _ in range(20):
+        used, annotations = set(), []
+        for _ in range(rng.randint(7, 12)):
+            s = 2 * rng.randint(0, 6)
+            e = s + 2 * rng.randint(1, 3)
+            lid = rng.randint(1, 3)
+            if (s, e, lid) in used:
+                continue
+            used.add((s, e, lid))
+            annotations.append(ann(1, s, e, lid, rng.randint(1, 10)))
+            annotations.append(ann(2, s, e, lid, rng.randint(1, 10)))
+        nesting, mutex = {(3, 1)}, {(1, 2)}
+        res = solve_consensus(annotations, nesting, mutex)
+        keys = [(c.start, c.end, c.label_id) for c in res.candidates]
+        n = len(keys)
+        scores = {
+            (c.start, c.end, c.label_id): c.score for c in res.candidates
+        }
+        ms = {frozenset(p) for p in mutex}
+
+        def ov(i, j):
+            return keys[i][0] < keys[j][1] and keys[j][0] < keys[i][1]
+
+        def cc(io, ii):
+            so, eo, _ = keys[io]
+            si, ei, _ = keys[ii]
+            return so <= si and ei <= eo and (so < si or ei < eo)
+
+        best = (-1, None)
+        for vec in range(1 << n):
+            bits = [(vec >> i) & 1 for i in range(n)]
+            ok = True
+            for i in range(n):
+                for j in range(i + 1, n):
+                    if bits[i] and bits[j] and ov(i, j):
+                        li, lj = keys[i][2], keys[j][2]
+                        if frozenset((li, lj)) in ms:
+                            ok = False
+                            break
+                        if cc(i, j) and (li, lj) in nesting:
+                            continue
+                        if cc(j, i) and (lj, li) in nesting:
+                            continue
+                        ok = False
+                        break
+                if not ok:
+                    break
+            if not ok:
+                continue
+            total = sum(scores[keys[i]] for i in range(n) if bits[i])
+            if (total, tuple(bits)) > best:
+                best = (total, tuple(bits))
+        assert tuple(res.chosen) == best[1]
+        assert res.total_score == best[0]
+
+
+def test_override_still_works_with_many_candidates():
+    # 89 个互不重叠的独立 L1 候选（从 [6,8) 起，各 20 分），加上
+    # [0,2) 上同分的 L1 / L2 互斥候选（各 20 分），共 91 个候选。
+    annotations = []
+    for k in range(89):
+        s = 6 + 2 * k
+        annotations += [ann(1, s, s + 2, 1, 1), ann(2, s, s + 2, 1, 1)]
+    annotations += [
+        ann(1, 0, 2, 1, 1), ann(2, 0, 2, 1, 1),
+        ann(1, 0, 2, 2, 1), ann(2, 0, 2, 2, 1),
+    ]
+    res = solve_consensus(
+        annotations, set(), {(1, 2)}, SolveParams(),
+        force_selected_keys={(0, 2, 2)},
+    )
+    assert res.status == "OPTIMAL"
+    by = {(c.start, c.end, c.label_id): c for c in res.candidates}
+    # 强制采纳 L2 => 同区间同分的 L1 因互斥必须落选
+    assert res.chosen[by[(0, 2, 2)].index] is True
+    assert res.chosen[by[(0, 2, 1)].index] is False
+    assert sum(res.chosen) == 90  # 其余 89 个独立候选不受影响
